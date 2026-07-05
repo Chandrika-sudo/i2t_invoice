@@ -1,20 +1,24 @@
-"""
-validation/vendor_rules.py
-Validates the vendor against the approved vendor master (vendors.json).
-Skipped for RECEIPT documents.
-"""
-import json, os
+import json
+import os
 
 VENDOR_FILE = os.path.join(os.path.dirname(__file__), "../config/vendors.json")
 
-def check(data: dict) -> list[str]:
+
+
+def check(data):
+    flags = []
+
     if data.get("doc_type") == "RECEIPT":
-        return []
+        return flags
+
     try:
         with open(VENDOR_FILE) as f:
-            vendors: dict = json.load(f)
+            vendors = json.load(f)
     except FileNotFoundError:
         return ["Vendor master missing"]
+
     if data.get("vendor") not in vendors:
-        return ["Unknown vendor"]
-    return []
+        flags.append("Unknown vendor")
+
+    return flags
+

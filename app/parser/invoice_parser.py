@@ -1,201 +1,143 @@
-"""
-parser/invoice_parser.py
-Handles Indian GST invoices and UAE VAT invoices.
-Robust to Tesseract OCR noise (column collapse, symbol misreads).
-"""
-
+from __future__ import annotations
 import re
 from typing import Optional
 
-InvoiceData = dict[str, Optional[str | float]]
+
+_GSTIN_RE = re.compile(
+    r"\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]\b"
+)
+
+_TRN_RE = re.compile(r"\b1\d{14}\b")
+
+_INV_NO_RE = re.compile(
+    r"(?:INVOICE|BILL|INV)[^\w]{0,5}(?:NO|NUM|NUMBER|#)[^\w]{0,5}([\w\-/]+)",
+    re.IGNORECASE,
+)
+
+_DATE_RE = re.compile(
+    r"\b(?:\d{4}[-/]\d{2}[-/]\d{2}|\d{2}[-/.\s]\d{2}[-/.\s]\d{4})\b"
+)
+
+_TAX_PCT_RE = re.compile(r"\bTAX\b.{0,20}?(\d{1,2}(?:\.\d+)?)\s?%", re.IGNORECASE)
+
+_VENDOR_LABEL_RE = re.compile(r"\b(PAY TO|FROM|VENDOR|SOLD BY|REMIT TO)\b\s*:?\s*", re.IGNORECASE)
+_HEADER_NOISE_RE = re.compile(r"\b(ISSUED TO|INVOICE NO|BILL TO|DATE|DUE DATE)\b", re.IGNORECASE)
 
 
-def _clean_amount(raw: str) -> float:
-    """Convert a string like '20,000.00' or 'AED 20,000.00' to float."""
-    # Remove commas and spaces, then extract the first number (including decimals)
-    raw = raw.replace(",", "").replace(" ", "")
-    match = re.search(r"(\d+(?:\.\d{2})?)", raw)
-    return float(match.group(1)) if match else 0.0
-
-
-def _find_amounts(line: str) -> list[float]:
-    """Return all amounts found in a line, left to right."""
-    results = []
-    # Match patterns like 123.45, 1,234.56
-    for m in re.findall(r"[\d,]+\.\d{2}", line):
+def _first_amount(pattern: re.Pattern, text: str) -> Optional[float]:
+    m = pattern.search(text)
+    if m:
+        raw = re.sub(r"[^\d.]", "", m.group(1))
         try:
-            val = _clean_amount(m)
-            if val > 0:
-                results.append(val)
+            return float(raw)
         except ValueError:
             pass
-    return results
+    return None
 
 
-def parse_invoice(text: str) -> InvoiceData:
-    data: InvoiceData = {
-        "doc_type": "INVOICE",
+def _build_label_amount_re(labels: list[str]) -> re.Pattern:
+    label_group = "|".join(re.escape(l) for l in labels)
+    return re.compile(
+        rf"(?<!\w)(?:{label_group})(?!\w).{{0,50}}?([\d,]+(?:\.\d{{1,2}})?)\b",
+        re.IGNORECASE,
+    )
+
+
+_TOTAL_RE    = _build_label_amount_re(["GRAND TOTAL", "TOTAL AMOUNT", "AMOUNT DUE", "NET PAYABLE", "TOTAL"])
+_TAX_RE      = _build_label_amount_re(["IGST", "CGST", "SGST", "TOTAL TAX", "TAX AMOUNT", "VAT AMOUNT", "VAT", "GST", "TAX"])
+_SUBTOTAL_RE = _build_label_amount_re(["SUBTOTAL", "SUB-TOTAL", "SUB TOTAL", "TAXABLE VALUE", "TAXABLE AMOUNT", "NET AMOUNT"])
+
+
+def _clean(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[^\S\n]+", " ", text)
+    return text
+
+
+def _detect_region(text: str) -> str:
+    upper = text.upper()
+    if _GSTIN_RE.search(upper) or "GSTIN" in upper:
+        return "IN"
+    if _TRN_RE.search(upper) or "TRN" in upper or ("VAT" in upper and "GST" not in upper):
+        return "AE"
+    return "UNKNOWN"
+
+
+def _extract_vendor(lines: list[str]) -> Optional[str]:
+    for i, line in enumerate(lines):
+        if _VENDOR_LABEL_RE.search(line):
+            after = _VENDOR_LABEL_RE.sub("", line).strip()
+            if after:
+                return after
+            if i + 1 < len(lines):
+                return lines[i + 1].strip()
+
+    skip_keywords = {"invoice", "tax invoice", "bill", "receipt", "credit note", "debit note"}
+    for line in lines[:5]:
+        if line.lower() in skip_keywords or len(line) <= 2:
+            continue
+        if _HEADER_NOISE_RE.search(line):
+            continue
+        return line
+    return None
+
+
+def parse_invoice(text: str) -> dict:
+    text = _clean(text)
+    upper = text.upper()
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    data: dict = {
+        "doc_type":   "INVOICE",
+        "region":     _detect_region(text),
         "invoice_no": None,
-        "vendor": None,
-        "tax_id": None,
-        "date": None,
-        "subtotal": None,
-        "tax": None,
-        "total": None,
+        "vendor":     None,
+        "tax_id":     None,
+        "date":       None,
+        "subtotal":   None,
+        "tax":        None,
+        "total":      None,
     }
 
-    lines = [l.strip() for l in text.splitlines()]
-    nonempty = [l for l in lines if l]
-    full_upper = text.upper()
-
-    # Document type
-    if re.search(r"\bRECEIPT\b", full_upper):
+    if re.search(r"\bCASH\s+RECEIPT\b|\bRECEIPT\b", upper):
         data["doc_type"] = "RECEIPT"
+    elif re.search(r"\bCREDIT\s+NOTE\b", upper):
+        data["doc_type"] = "CREDIT_NOTE"
+    elif re.search(r"\bDEBIT\s+NOTE\b", upper):
+        data["doc_type"] = "DEBIT_NOTE"
 
-    # Vendor (first non‑header line)
-    skip = re.compile(r"^(tax\s+invoice|invoice|receipt|bill)$", re.IGNORECASE)
-    inv_label_noise = re.compile(
-        r"\s+inv[a-z]*[\s.]*(?:no|num|number)[.,:\s].*$", re.IGNORECASE
-    )
-    for line in nonempty:
-        if skip.match(line) or len(line) <= 4:
-            continue
-        clean = inv_label_noise.sub("", line).strip()
-        if clean and len(clean) > 4:
-            data["vendor"] = clean
-            break
+    data["vendor"] = _extract_vendor(lines)
 
-    # Invoice number
-    upper_nonempty = [l.upper() for l in nonempty]
-    for i, ul in enumerate(upper_nonempty):
-        if re.search(r"INV[A-Z]*[\s.]*(?:NO|NUM|NUMBER)[.,:\s]", ul):
-            after = re.sub(
-                r".*INV[A-Z]*[\s.]*(?:NO|NUM|NUMBER)[.,:\s]*", "", ul
-            ).strip()
-            num_here = re.match(r"^(\d+)\b", after)
-            if num_here:
-                data["invoice_no"] = num_here.group(1)
-                break
-            for j in range(i + 1, min(i + 3, len(nonempty))):
-                num_next = re.search(r"\b(\d{1,6})\b", nonempty[j])
-                if num_next:
-                    data["invoice_no"] = num_next.group(1)
-                    break
-            break
+    m = _INV_NO_RE.search(text)
+    if m:
+        data["invoice_no"] = m.group(1).upper()
 
-    # Tax ID (GSTIN or TRN)
-    for line in nonempty:
-        # Look for GSTIN label
-        if re.search(r"GSTIN", line, re.IGNORECASE):
-            after = re.sub(
-                r".*GSTIN[A-Z/:\s\-]*", "", line, flags=re.IGNORECASE
-            ).strip()
-            compact = re.sub(r"\s+", "", after)[:15]
-            if re.match(
-                r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$",
-                compact, re.IGNORECASE
-            ):
-                data["tax_id"] = compact.upper()
-                break
+    gst = _GSTIN_RE.search(upper)
+    if gst:
+        data["tax_id"] = gst.group(0)
+    else:
+        trn = _TRN_RE.search(upper)
+        if trn:
+            data["tax_id"] = trn.group(0)
 
-        # Or find any token that looks like a GSTIN (Indian)
-        for token_group in re.findall(
-            r"[A-Z0-9]{5,}(?:\s[A-Z0-9]+)*", line, re.IGNORECASE
-        ):
-            compact = re.sub(r"\s+", "", token_group)
-            if re.match(
-                r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$",
-                compact, re.IGNORECASE
-            ):
-                if not data["tax_id"]:
-                    data["tax_id"] = compact.upper()
+    d = _DATE_RE.search(text)
+    if d:
+        data["date"] = d.group(0).strip()
 
-    # If not found, try TRN (UAE)
-    if not data["tax_id"]:
-        for line in nonempty:
-            if re.search(r"\bTRN\b", line, re.IGNORECASE):
-                trn = re.search(r"\b(\d{10,15})\b", line)
-                if trn:
-                    data["tax_id"] = trn.group(1)
-                    break
+    data["total"]    = _first_amount(_TOTAL_RE,    text) or _first_amount(_TOTAL_RE,    upper)
+    data["tax"]      = _first_amount(_TAX_RE,      text) or _first_amount(_TAX_RE,      upper)
+    data["subtotal"] = _first_amount(_SUBTOTAL_RE, text) or _first_amount(_SUBTOTAL_RE, upper)
 
-    # Date
-    date_m = (
-        re.search(r"\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})\b", text)
-        or re.search(
-            r"\b(\d{1,2}[\s\-—./]+"
-            r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
-            r"[\s\-—./]+\d{2,4})\b",
-            text, re.IGNORECASE
-        )
-    )
-    if date_m:
-        data["date"] = date_m.group(1).strip()
+    if data["tax"] is None:
+        pct = _TAX_PCT_RE.search(text)
+        if pct and data["subtotal"] is not None:
+            data["tax"] = round(data["subtotal"] * float(pct.group(1)) / 100, 2)
 
-    # Total (handle lines with currency symbols)
-    CURRENCY_PREFIX = re.compile(
-        r"\b(?:AED|USD|EUR|GBP|INR|SAR|QAR|OMR|BHD|KWD)\b",
-        re.IGNORECASE
-    )
-
-    # First pass: look for a "total" line that contains an amount
-    for line in nonempty:
-        if re.match(r"total\b", line, re.IGNORECASE):
-            cleaned_line = CURRENCY_PREFIX.sub("", line)
-            amounts = _find_amounts(cleaned_line)
-            if amounts:
-                # Prefer the last amount (rightmost) as the grand total
-                data["total"] = amounts[-1]
-                break
-
-    # If still missing, try "Amount Chargeable" section
-    if not data["total"]:
-        for line in nonempty:
-            if re.search(r"amount chargeable", line, re.IGNORECASE):
-                # Look for pattern like (AED 20,000.00) or just 20,000.00
-                match = re.search(r"\(?AED\s*([\d,]+\.\d{2})\)?", line, re.IGNORECASE)
-                if match:
-                    data["total"] = _clean_amount(match.group(1))
-                else:
-                    amounts = _find_amounts(line)
-                    if amounts:
-                        data["total"] = amounts[-1]
-                if data["total"]:
-                    break
-
-    # Tax (skip header lines that have no amounts)
-    for line in nonempty:
-        if re.search(
-            r"\bIG[ST]?[ST]?\b|\bCG[ST]+\b|\bSG[ST]+\b|\bVAT\b|\bTAX\b",
-            line, re.IGNORECASE
-        ):
-            amounts = _find_amounts(line)
-            if amounts:
-                # Take the last amount (likely the tax value)
-                data["tax"] = amounts[-1]
-                break
-            # If no amounts, keep scanning (don't break)
-
-    # Subtotal
-    for line in nonempty:
-        if re.search(
-            r"taxable\s*(?:value|amt|amount)|sub\s*total|subtotal|exempt",
-            line, re.IGNORECASE
-        ):
-            amounts = _find_amounts(line)
-            if amounts:
-                data["subtotal"] = amounts[-1]
-                break
-
-    # Derive missing fields using total and tax
-    t, x, s = data["total"], data["tax"], data["subtotal"]
-    if s is None and t is not None and x is not None:
-        data["subtotal"] = round(t - x, 2)
-    elif x is None and t is not None and s is not None:
-        data["tax"] = round(t - s, 2)
-
-    # If subtotal is still missing and tax is zero, assume subtotal = total
-    if s is None and t is not None and x == 0.0:
-        data["subtotal"] = t
+    if data["total"] is not None and data["tax"] is not None and data["subtotal"] is None:
+        data["subtotal"] = round(data["total"] - data["tax"], 2)
+    elif data["subtotal"] is not None and data["tax"] is not None and data["total"] is None:
+        data["total"] = round(data["subtotal"] + data["tax"], 2)
+    elif data["subtotal"] is not None and data["total"] is not None and data["tax"] is None:
+        data["tax"] = round(data["total"] - data["subtotal"], 2)
 
     return data

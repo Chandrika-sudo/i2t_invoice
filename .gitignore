@@ -1,3 +1,5 @@
+scripts
+venv
 .env
 __pycache__/
 data/processed_images/
