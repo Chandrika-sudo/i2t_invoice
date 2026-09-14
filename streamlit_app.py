@@ -126,39 +126,24 @@ st.markdown(
 )
 
 
-def _load_pipeline():
-    """Import heavy modules lazily so the UI renders before they load."""
-    from app.ocr.preprocess import preprocess_image
-    from app.ocr.extractor import extract_text
-    from app.parser.invoice_parser import parse_invoice
-    from app.validation import tax_rules, vendor_rules, duplicate, anomaly
-    return preprocess_image, extract_text, parse_invoice, tax_rules, vendor_rules, duplicate, anomaly
+def run_on_bytes(raw_bytes: bytes, filename: str, historical_avg: float, use_llm: bool = True) -> dict:
+    """Save uploaded bytes temporarily and run the shared audit pipeline."""
+    from app.audit.auditor import run_audit
 
-
-def run_on_bytes(raw_bytes: bytes, filename: str, historical_avg: float) -> dict:
-    """Save bytes to a temp file and run the full audit pipeline."""
     suffix = Path(filename).suffix or ".jpg"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(raw_bytes)
         tmp_path = tmp.name
 
     try:
-        preprocess_image, extract_text, parse_invoice, tax_rules, vendor_rules, duplicate, anomaly = _load_pipeline()
-
-        img_arr = preprocess_image(tmp_path)
-        text = extract_text(img_arr)
-        data = parse_invoice(text)
-
-        flags: list[str] = []
-        flags += tax_rules.check(data)
-        flags += vendor_rules.check(data)
-        flags += duplicate.check(data)
-        flags += anomaly.check(data, historical_avg=historical_avg)
-
-        status = "REVIEW" if flags else "APPROVED"
-        return {"invoice_data": data, "raw_text": text, "flags": flags, "status": status}
+        return run_audit(
+            tmp_path,
+            historical_avg=historical_avg,
+            use_llm=use_llm,
+        )
     finally:
-        os.unlink(tmp_path)
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def _field_card(label: str, value, is_currency: bool = False) -> None:
@@ -194,6 +179,16 @@ with st.sidebar:
         help="Used by anomaly detection to flag unusually large invoices.",
     )
     st.divider()
+
+    use_llm = st.checkbox(
+        "🤖 Enable AI review",
+        value=True,
+        help=(
+            "Sends OCR text and parser output to the configured LLM for a second-opinion "
+            "consistency review. The API key is never stored in the repository."
+        ),
+    )
+    st.divider()
     st.markdown(
         "**What this checks**\n"
         "- Vendor, invoice no., GSTIN/TRN\n"
@@ -201,7 +196,8 @@ with st.sidebar:
         "- Tax arithmetic & rate consistency\n"
         "- Known vendors\n"
         "- Duplicate invoices\n"
-        "- Statistical anomalies"
+        "- Statistical anomalies\n"
+        "- AI review of OCR text and extracted fields"
     )
 
 if mode == "Single Invoice":
@@ -225,9 +221,9 @@ if mode == "Single Invoice":
         with col_results:
             st.markdown("#### Audit Results")
 
-            with st.spinner("Running OCR pipeline…"):
+            with st.spinner("Running OCR pipeline + AI review…" if use_llm else "Running OCR pipeline…"):
                 try:
-                    result = run_on_bytes(uploaded.read(), uploaded.name, historical_avg)
+                    result = run_on_bytes(uploaded.read(), uploaded.name, historical_avg, use_llm=use_llm)
                 except Exception as e:
                     st.error(f"Pipeline error: {e}")
                     st.stop()
@@ -249,6 +245,30 @@ if mode == "Single Invoice":
                         st.markdown(f'<div class="flag-box">⚠️ {f}</div>', unsafe_allow_html=True)
             else:
                 st.success("No issues detected.")
+
+            ai = result.get("ai_review", {})
+            if use_llm:
+                ai_status = ai.get("status", "UNKNOWN")
+                with st.expander("🤖 AI Review Details", expanded=False):
+                    if ai_status == "PASSED":
+                        st.success(f"AI review passed · confidence {ai.get('confidence', 0):.0%}")
+                    elif ai_status == "FLAGGED":
+                        st.warning(f"AI review flagged this invoice · confidence {ai.get('confidence', 0):.0%}")
+                    elif ai_status == "UNAVAILABLE":
+                        st.warning(f"AI review unavailable: {ai.get('error', 'unknown error')}")
+                    else:
+                        st.error(f"AI review error: {ai.get('error', 'unknown error')}")
+
+                    if ai.get("issues"):
+                        for issue in ai["issues"]:
+                            st.markdown(
+                                f"**{issue['severity']} · {issue['type']}** — {issue['message']}"
+                            )
+                            if issue.get("evidence"):
+                                st.caption(f"Evidence: {issue['evidence']}")
+
+            with st.expander("🔎 Raw OCR text", expanded=False):
+                st.code(result.get("raw_text", ""), language="text")
 
             st.write("")
 
@@ -276,7 +296,7 @@ if mode == "Single Invoice":
             st.write("")
             st.download_button(
                 "⬇️ Download JSON",
-                data=json.dumps(result["invoice_data"], indent=2),
+                data=json.dumps(result, indent=2, default=str),
                 file_name=f"invoice_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                 mime="application/json",
                 width="stretch",
@@ -301,7 +321,7 @@ else:
         for i, f in enumerate(uploaded_files):
             status_text.text(f"Processing {f.name} ({i+1}/{len(uploaded_files)})…")
             try:
-                result = run_on_bytes(f.read(), f.name, historical_avg)
+                result = run_on_bytes(f.read(), f.name, historical_avg, use_llm=use_llm)
                 inv = result["invoice_data"]
                 rows.append({
                     "file":       f.name,

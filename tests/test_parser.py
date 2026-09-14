@@ -94,3 +94,47 @@ def test_date_parsed():
 def test_vendor_first_line():
     d = parse_invoice(SAMPLE_GST)
     assert "ACME" in d["vendor"]
+
+
+def test_tax_parentheses_do_not_become_tax_amount():
+    d = parse_invoice(SAMPLE_GST)
+    assert d["tax"] == 1525.42
+
+
+def test_subtotal_can_be_derived_from_total_and_tax():
+    text = """
+    ACME Traders Pvt. Ltd.
+    Invoice No: INV-55
+    GSTIN: 27AAPFU0939F1ZV
+    GST (18%): 1525.42
+    TOTAL: 10000.00
+    """
+    d = parse_invoice(text)
+    assert d["tax"] == 1525.42
+    assert d["subtotal"] == 8474.58
+
+
+def test_currency_amounts_and_tax_rate_invoice():
+    text = """
+    INVOICE
+    ISSUED TO:
+    Richard Sanchez
+    Thynk Unlimited
+    123 Anywhere St., Any City
+    PAY TO:
+    Borcele Bank
+    Account Name: Adeline Palmerston
+    Invoice No: 01234
+    DATE: 11.02.2030
+    SUBTOTAL $400
+    Tax 10%
+    TOTAL $440
+    """
+    d = parse_invoice(text)
+    assert d["invoice_no"] == "01234"
+    assert d["subtotal"] == 400.0
+    assert d["tax_rate"] == 10.0
+    assert d["tax"] == 40.0
+    assert d["total"] == 440.0
+    assert d["payment_recipient"] == "Borcele Bank"
+    assert d["vendor"] is None

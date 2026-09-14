@@ -1,0 +1,12 @@
+[2026-09-14 13:03:40] WARNING  llm.reviewer — LLM review unavailable: no API key
+[2026-09-14 13:03:40] WARNING  llm.reviewer — LLM review unavailable: no API key
+[2026-09-14 13:03:40] WARNING  llm.reviewer — Could not parse LLM review response: Expecting value: line 1 column 1 (char 0)
+[2026-09-14 13:05:21] INFO     auditor — Starting audit for: tmpb5bhjp1w.jpeg
+[2026-09-14 13:05:21] INFO     auditor — Parsed — vendor=Borcele Bank inv=01234 total=None region=UNKNOWN
+[2026-09-14 13:05:34] INFO     auditor — Audit complete — status=REVIEW rule_flags=3 ai_flags=4
+[2026-09-14 13:19:22] WARNING  llm.reviewer — LLM review unavailable: no API key
+[2026-09-14 13:19:22] WARNING  llm.reviewer — LLM review unavailable: no API key
+[2026-09-14 13:19:22] WARNING  llm.reviewer — Could not parse LLM review response: Expecting value: line 1 column 1 (char 0)
+[2026-09-14 13:19:43] INFO     auditor — Starting audit for: tmpxqhdzin1.jpeg
+[2026-09-14 13:19:43] INFO     auditor — Parsed — vendor=None inv=01234 total=440.0 region=UNKNOWN
+[2026-09-14 13:19:46] INFO     auditor — Audit complete — status=REVIEW rule_flags=3 ai_flags=2
