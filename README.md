@@ -2,6 +2,10 @@
 
 OCR-powered invoice auditing for Indian GST and UAE VAT invoices, with an optional LLM second-opinion review.
 
+Project Demo:
+https://github.com/user-attachments/assets/a34956c9-e860-4779-845f-e2ce65038200
+
+
 Live link: https://i2tinvoice-zj9qvynjbwmkelu63swhwx.streamlit.app/
 
 ## Pipeline
